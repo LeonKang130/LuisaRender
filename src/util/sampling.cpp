@@ -197,4 +197,47 @@ Float sample_exponential(Expr<float> u, Expr<float> a) noexcept {
     return -log(1.f - u) / a;
 }
 
+// reference: https://dl.acm.org/doi/10.1145/2816795.2818131
+// see also: https://www.shadertoy.com/view/lllXz4
+
+template<typename T0, typename T1>
+[[nodiscard]] auto madfrac(T0 a, T1 b) noexcept {
+    auto t = a * b;
+    return t - floor(t);
+}
+
+Float3 decode_spherical_fibonacci(Expr<float> i, Expr<float> n) noexcept {
+    auto constexpr PHI = 1.618033988749895f;
+    auto phi = 2.f * pi * madfrac(i, PHI - 1.f);
+    auto cosTheta = 1.f - (2.f * i + 1.f) / n;
+    auto sinTheta = sqrt(1.f - cosTheta * cosTheta);
+    return make_float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+}
+
+Float encode_spherical_fibonacci(Expr<float3> p, Expr<float> n) noexcept {
+    auto SQRT_5 = 2.23606797749979f;
+    auto PHI = 1.618033988749895f;
+    auto phi = min(atan2(p.y, p.x), pi);
+    auto cosTheta = p.z;
+    auto k = max(2.f, floor(log2(n * pi * SQRT_5 * (1.f - cosTheta * cosTheta)) / log2(PHI + 1.f)));
+    auto Fk = pow(PHI, k) / SQRT_5;
+    auto F = make_float2(round(Fk), round(Fk * PHI));
+    auto ka = 2.f * F / n;
+    auto kb = 2.f * pi * (fract((F + 1.f) * PHI) - (PHI - 1.f));
+    auto invB = make_float2x2(ka.y, -ka.x, kb.y, -kb.x) / (ka.y * kb.x - ka.x * kb.y);
+    auto c = floor(invB * make_float2(phi, cosTheta - (1.f - 1.f / n)));
+    auto d = def(INFINITY), j = def(0.f);
+    for (auto s = 0u; s < 4u; ++s) {
+        auto uv = make_float2(cast<float>(s & 1u), cast<float>(s >> 1u));
+        auto i = clamp(dot(F, c + uv), 0.f, n - 1.f);
+        auto q = decode_spherical_fibonacci(i, n);
+        auto squaredDistance = distance_squared(p, q);
+        $if(squaredDistance < d) {
+            d = squaredDistance;
+            j = i;
+        };
+    }
+    return j;
+}
+
 }// namespace luisa::render

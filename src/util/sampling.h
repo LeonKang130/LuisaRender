@@ -75,6 +75,9 @@ template<typename ProbTable, typename AliasTable>
 [[nodiscard]] UInt sample_discrete(const SampledSpectrum &weights, Expr<float> u) noexcept;
 [[nodiscard]] Float sample_exponential(Expr<float> u, Expr<float> a) noexcept;
 
+[[nodiscard]] Float3 decode_spherical_fibonacci(Expr<float> i, Expr<float> n) noexcept;
+[[nodiscard]] Float encode_spherical_fibonacci(Expr<float3> p, Expr<float> n) noexcept;
+
 }// namespace luisa::render
 
 LUISA_STRUCT(luisa::render::AliasEntry, prob, alias){};
