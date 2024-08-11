@@ -39,6 +39,7 @@ template<uint dim, typename F>
 class ReSTIR final : public ProgressiveIntegrator {
 
 private:
+    bool _presample_lights;
     bool _visibility_reuse;
     bool _temporal_reuse;
     bool _spatial_reuse;
@@ -46,6 +47,7 @@ private:
 public:
     ReSTIR(Scene *scene, const SceneNodeDesc *desc) noexcept
         : ProgressiveIntegrator{scene, desc},
+          _presample_lights{desc->property_bool_or_default("presample_lights", true)},
           _visibility_reuse{desc->property_bool_or_default("visibility_reuse", true)},
           _temporal_reuse{desc->property_bool_or_default("temporal_reuse", true)},
           _spatial_reuse{desc->property_bool_or_default("spatial_reuse", true)},
@@ -53,6 +55,7 @@ public:
     [[nodiscard]] luisa::string_view impl_type() const noexcept override { return LUISA_RENDER_PLUGIN_NAME; }
     [[nodiscard]] luisa::unique_ptr<Integrator::Instance> build(
         Pipeline &pipeline, CommandBuffer &cb) const noexcept override;
+    [[nodiscard]] bool presample_lights() const noexcept { return _presample_lights; }
     [[nodiscard]] bool visibility_reuse() const noexcept { return _visibility_reuse; }
     [[nodiscard]] bool temporal_reuse() const noexcept { return _temporal_reuse; }
     [[nodiscard]] bool spatial_reuse() const noexcept { return _spatial_reuse; }
@@ -82,6 +85,34 @@ public:
         void write_ray(Expr<uint> index, Expr<Ray> ray) noexcept { _ray->write(index, ray); }
         void write_hit(Expr<uint> index, Expr<Hit> hit) noexcept { _hit->write(index, hit); }
         void write_camera_weight(Expr<uint> index, Expr<float> w) noexcept { _w->write(index, w); }
+    };
+
+    class LightSubsetBuffer {
+    private:
+        Buffer<float> _u_sel;
+        Buffer<float2> _u_light;
+    public:
+        static auto constexpr subset_size = 64u;
+        static auto constexpr subset_num = 128u;
+        LightSubsetBuffer(const Spectrum::Instance *spectrum) noexcept {
+            auto &&device = spectrum->pipeline().device();
+            _u_sel = device.create_buffer<float>(subset_num * subset_size);
+            _u_light = device.create_buffer<float2>(subset_num * subset_size);
+        }
+        void write(Expr<uint> index, Expr<float> u_sel, Expr<float2> u_light) const noexcept {
+            _u_sel->write(index, u_sel);
+            _u_light->write(index, u_light);
+        }
+        [[nodiscard]] auto read(Expr<uint> index) const noexcept {
+            auto u_sel = _u_sel->read(index);
+            auto u_light = _u_light->read(index);
+            return std::make_pair(u_sel, u_light);
+        }
+        [[nodiscard]] auto sample(Expr<float> u1, Expr<float> u2) const noexcept {
+            auto subset_index = clamp(u1 * static_cast<float>(subset_num), 0.f, subset_num - 1.f).cast<uint>();
+            auto subset_offset = clamp(u2 * static_cast<float>(subset_size), 0.f, subset_size - 1.f).cast<uint>();
+            return read(subset_index * subset_size + subset_offset);
+        }
     };
 
     class ReservoirBuffer {
@@ -148,6 +179,7 @@ public:
 
 private:
     luisa::unique_ptr<VisibilityBuffer> _visibility_buffer;
+    luisa::unique_ptr<LightSubsetBuffer> _light_subset_buffer;
     luisa::unique_ptr<ReservoirBuffer> _reservoir_buffer;
     luisa::unique_ptr<ReservoirBuffer> _reservoir_buffer_out;
 protected:
@@ -168,6 +200,9 @@ protected:
         if (!_visibility_buffer) {
             _visibility_buffer = luisa::make_unique<VisibilityBuffer>(pipeline().spectrum(), pixel_count);
         }
+        if (!_light_subset_buffer) {
+            _light_subset_buffer = luisa::make_unique<LightSubsetBuffer>(pipeline().spectrum());
+        }
         if (!_reservoir_buffer) {
             _reservoir_buffer = luisa::make_unique<ReservoirBuffer>(pipeline().spectrum(), pixel_count);
         }
@@ -186,6 +221,12 @@ protected:
         auto ray_buffer = device.create_buffer<Ray>(pixel_count);
         auto hit_buffer = device.create_buffer<Hit>(pixel_count);
         Clock clock_compile;
+        auto presample_light_shader = compile_async<1>(device, [&](UInt frame_index) noexcept {
+            set_block_size(256u);
+            auto i = dispatch_id().x;
+            sampler()->start(make_uint2(i, i), frame_index);
+            _light_subset_buffer->write(i, sampler()->generate_1d(), sampler()->generate_2d());
+        });
         auto sample_light_shader = compile_async<2>(device, [&](UInt frame_index, Float time) noexcept {
             set_block_size(16u, 16u, 1u);
             auto pixel_id = dispatch_id().xy();
@@ -220,6 +261,7 @@ protected:
             camera->film()->accumulate(pixel_id, shutter_weight * L);
         });
         // wait for the compilation of all shaders
+        presample_light_shader.get().set_name("presample_light");
         sample_light_shader.get().set_name("sample_light");
         temporal_reuse_shader.get().set_name("temporal_reuse");
         swap_buffer_shader.get().set_name("swap_buffer");
@@ -240,6 +282,9 @@ protected:
             pipeline().update(command_buffer, s.point.time);
             for (auto i = 0u; i < s.spp; i++) {
                 // camera->film()->clear(command_buffer);
+                if (node<ReSTIR>()->presample_lights()) {
+                    command_buffer << presample_light_shader.get()(sample_id).dispatch(LightSubsetBuffer::subset_num * LightSubsetBuffer::subset_size);
+                }
                 command_buffer << sample_light_shader.get()(sample_id, s.point.time).dispatch(resolution);
                 if (node<ReSTIR>()->temporal_reuse() && sample_id != 0u) {
                     command_buffer << temporal_reuse_shader.get()(sample_id, s.point.time).dispatch(resolution);
@@ -271,6 +316,8 @@ protected:
         LUISA_INFO("Rendering finished in {} ms.", render_time);
     }
     void _sample_light(const Camera::Instance *camera, Expr<uint> frame_index, Expr<uint2> pixel_id, Expr<float> time) const noexcept {
+        sampler()->start($block_id.xy(), frame_index);
+        auto u_subset = sampler()->generate_1d();
         sampler()->start(pixel_id, frame_index);
         auto resolution = camera->film()->node()->resolution();
         auto index = pixel_id.x + pixel_id.y * resolution.x;
@@ -303,8 +350,17 @@ protected:
                 }
                 // sample light candidates
                 $for (x, 0u, 32u) {
-                    auto u_sel = sampler()->generate_1d();
-                    auto u_light = sampler()->generate_2d();
+                    auto u_sel = def(0.f);
+                    auto u_light = def(make_float2(0.f));
+                    if (node<ReSTIR>()->presample_lights()) {
+                        auto [uu_sel, uu_light] = _light_subset_buffer->sample(u_subset, sampler()->generate_1d());
+                        u_sel = uu_sel;
+                        u_light = uu_light;
+                    }
+                    else {
+                        u_sel = sampler()->generate_1d();
+                        u_light = sampler()->generate_2d();
+                    }
                     auto light_sample = LightSampler::Sample::zero(swl.dimension());
                     $outline {
                         light_sample = light_sampler()->sample(
