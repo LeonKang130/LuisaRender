@@ -5,10 +5,32 @@
 #include <dsl/syntax.h>
 #include <util/progress_bar.h>
 #include <util/sampling.h>
+#include <util/thread_pool.h>
 #include <base/pipeline.h>
 #include <base/integrator.h>
 
 namespace luisa::render {
+
+template<uint dim, typename F>
+[[nodiscard]] auto compile_async(Device &device, F &&f) noexcept {
+    using namespace compute;
+    auto kernel = [&] {
+        if constexpr (dim == 1u) {
+            return Kernel1D{f};
+        } else if constexpr (dim == 2u) {
+            return Kernel2D{f};
+        } else if constexpr (dim == 3u) {
+            return Kernel3D{f};
+        } else {
+            static_assert(always_false_v<F>, "Invalid dimension.");
+        }
+    }();
+    ShaderOption o{};
+    o.enable_debug_info = true;
+    return global_thread_pool().async([&device, o, kernel] {
+        return device.compile(kernel, o);
+    });
+}
 
 /*
  * Accompanied light sampling technique must be independent of shading points
@@ -163,48 +185,46 @@ protected:
         auto &&device = pipeline().device();
         auto ray_buffer = device.create_buffer<Ray>(pixel_count);
         auto hit_buffer = device.create_buffer<Hit>(pixel_count);
-        Kernel2D sample_light_kernel = [&](UInt frame_index, Float time) noexcept {
+        Clock clock_compile;
+        auto sample_light_shader = compile_async<2>(device, [&](UInt frame_index, Float time) noexcept {
             set_block_size(16u, 16u, 1u);
             auto pixel_id = dispatch_id().xy();
             _sample_light(camera, frame_index, pixel_id, time);
-        };
-        Kernel2D temporal_reuse_kernel = [&](UInt frame_index, Float time) noexcept {
+        });
+        auto temporal_reuse_shader = compile_async<2>(device, [&](UInt frame_index, Float time) noexcept {
             set_block_size(16u, 16u, 1u);
             auto pixel_id = dispatch_id().xy();
             temporal_reuse(camera, frame_index, pixel_id, time);
-        };
-        Kernel2D swap_buffer_kernel = [&]() noexcept {
+        });
+        auto swap_buffer_shader = compile_async<2>(device, [&]() noexcept {
             set_block_size(16u, 16u, 1u);
             auto pixel_id = dispatch_id().xy();
-            auto resolution = camera->film()->node()->resolution();
             auto index = pixel_id.x + pixel_id.y * resolution.x;
             auto r = _reservoir_buffer_out->read(index);
             _reservoir_buffer->write(index, r);
-        };
-        Kernel2D spatial_reuse_kernel = [&](UInt frame_index, UInt pass_index, Float time) noexcept {
+        });
+        auto spatial_reuse_shader = compile_async<2>(device, [&](UInt frame_index, UInt pass_index, Float time) noexcept {
             set_block_size(16u, 16u, 1u);
             auto pixel_id = dispatch_id().xy();
-            _spatial_reuse(camera, frame_index, pass_index, pixel_id, time);
-        };
-        Kernel2D unbiased_spatial_reuse_kernel = [&](UInt frame_index, UInt pass_index, Float time) noexcept {
-            set_block_size(16u, 16u, 1u);
-            auto pixel_id = dispatch_id().xy();
-            _unbiased_spatial_reuse(camera, frame_index, pass_index, pixel_id, time);
-        };
-        Kernel2D render_kernel = [&](UInt frame_index, Float time, Float shutter_weight) noexcept {
+            if(node<ReSTIR>()->unbiased()) {
+                _unbiased_spatial_reuse(camera, frame_index, pass_index, pixel_id, time);
+            }
+            else {
+                _spatial_reuse(camera, frame_index, pass_index, pixel_id, time);
+            }
+        });
+        auto render_shader = compile_async<2>(device, [&](UInt frame_index, Float time, Float shutter_weight) noexcept {
             set_block_size(16u, 16u, 1u);
             auto pixel_id = dispatch_id().xy();
             auto L = Li(camera, frame_index, pixel_id, time);
             camera->film()->accumulate(pixel_id, shutter_weight * L);
-        };
-
-        Clock clock_compile;
-        auto sample_light = pipeline().device().compile(sample_light_kernel);
-        auto temporal_reuse = pipeline().device().compile(temporal_reuse_kernel);
-        auto swap_buffer = pipeline().device().compile(swap_buffer_kernel);
-        auto spatial_reuse = pipeline().device().compile(spatial_reuse_kernel);
-        auto unbiased_spatial_reuse = pipeline().device().compile(unbiased_spatial_reuse_kernel);
-        auto render = pipeline().device().compile(render_kernel);
+        });
+        // wait for the compilation of all shaders
+        sample_light_shader.get().set_name("sample_light");
+        temporal_reuse_shader.get().set_name("temporal_reuse");
+        swap_buffer_shader.get().set_name("swap_buffer");
+        spatial_reuse_shader.get().set_name("spatial_reuse");
+        render_shader.get().set_name("render");
         auto integrator_shader_compilation_time = clock_compile.toc();
         LUISA_INFO("Integrator shader compile in {} ms.", integrator_shader_compilation_time);
         auto shutter_samples = camera->node()->shutter_samples();
@@ -220,24 +240,20 @@ protected:
             pipeline().update(command_buffer, s.point.time);
             for (auto i = 0u; i < s.spp; i++) {
                 // camera->film()->clear(command_buffer);
-                command_buffer << sample_light(sample_id, s.point.time).dispatch(resolution);
+                command_buffer << sample_light_shader.get()(sample_id, s.point.time).dispatch(resolution);
                 if (node<ReSTIR>()->temporal_reuse() && sample_id != 0u) {
-                    command_buffer << temporal_reuse(sample_id, s.point.time).dispatch(resolution);
+                    command_buffer << temporal_reuse_shader.get()(sample_id, s.point.time).dispatch(resolution);
                 }
-                command_buffer << swap_buffer().dispatch(resolution);
+                command_buffer << swap_buffer_shader.get()().dispatch(resolution);
                 if (node<ReSTIR>()->spatial_reuse()) {
                     for (auto j = 0u; j < 2u; j++) {
-                        if (node<ReSTIR>()->unbiased()) {
-                            command_buffer << unbiased_spatial_reuse(sample_id, j, s.point.time).dispatch(resolution);
-                        } else {
-                            command_buffer << spatial_reuse(sample_id, j, s.point.time).dispatch(resolution);
-                        }
-                        command_buffer << swap_buffer().dispatch(resolution);
+                        command_buffer << spatial_reuse_shader.get()(sample_id, j, s.point.time).dispatch(resolution);
+                        command_buffer << swap_buffer_shader.get()().dispatch(resolution);
                     }
                 }
-                command_buffer << render(sample_id++, s.point.time, s.point.weight)
+                command_buffer << render_shader.get()(sample_id++, s.point.time, s.point.weight)
                                       .dispatch(resolution);
-                command_buffer << swap_buffer().dispatch(resolution);
+                command_buffer << swap_buffer_shader.get()().dispatch(resolution);
                 dispatch_count++;
                 if (camera->film()->show(command_buffer)) { dispatch_count = 0u; }
                 auto dispatches_per_commit = 4u;
@@ -311,23 +327,23 @@ protected:
                     };
                     r = r.update(candidate, sampler()->generate_1d());
                 };
-                // visibility test
-                if (node<ReSTIR>()->visibility_reuse()) {
-                    auto light_sample = LightSampler::Sample::zero(swl.dimension());
-                    auto occluded = def(true);
-                    $outline {
-                        light_sample = light_sampler()->sample(
-                            *it, r.u_sel, r.u_light, swl, time);
-                    };
-                    $if (light_sample.eval.pdf > 0.f &
-                         light_sample.eval.L.any([](auto x) { return x > 0.f; })) {
-                        occluded = pipeline().geometry()->intersect_any(light_sample.shadow_ray);
-                    };
-                    $if (occluded) {
-                        r.p_hat = 0.f;
-                    };
-                }
             });
+            // visibility test
+            if (node<ReSTIR>()->visibility_reuse()) {
+                auto light_sample = LightSampler::Sample::zero(swl.dimension());
+                auto occluded = def(true);
+                $outline {
+                    light_sample = light_sampler()->sample(
+                        *it, r.u_sel, r.u_light, swl, time);
+                };
+                $if (light_sample.eval.pdf > 0.f &
+                     light_sample.eval.L.any([](auto x) { return x > 0.f; })) {
+                    occluded = pipeline().geometry()->intersect_any(light_sample.shadow_ray);
+                };
+                $if (occluded) {
+                    r.p_hat = 0.f;
+                };
+            }
             $break;
         };
         _reservoir_buffer_out->write(index, r);
@@ -351,6 +367,11 @@ protected:
             $if (!it->valid() | !it->shape().has_surface()) {
                 $break;
             };
+            auto light_sample = LightSampler::Sample::zero(swl.dimension());
+            $outline {
+                light_sample = light_sampler()->sample(
+                    *it, candidate.u_sel, candidate.u_light, swl, time);
+            };
             // evaluate material
             auto surface_tag = it->shape().surface_tag();
             PolymorphicCall<Surface::Closure> call;
@@ -363,11 +384,6 @@ protected:
                     $if (*dispersive) { swl.terminate_secondary(); };
                 }
                 // re-evaluate target function for temporal neighbor's sample
-                auto light_sample = LightSampler::Sample::zero(swl.dimension());
-                $outline {
-                    light_sample = light_sampler()->sample(
-                        *it, candidate.u_sel, candidate.u_light, swl, time);
-                };
                 $if (light_sample.eval.pdf > 0.f & candidate.p_hat > 0.f) {
                     auto wi = light_sample.shadow_ray->direction();
                     auto eval = closure->evaluate(wo, wi);
@@ -384,8 +400,8 @@ protected:
                 $else {
                     candidate.p_hat = candidate.w = 0.f;
                 };
-                r = r.update(candidate, sampler()->generate_1d());
             });
+            r = r.update(candidate, sampler()->generate_1d());
             $break;
         };
         _reservoir_buffer_out->write(index, r);
@@ -534,21 +550,21 @@ protected:
                     neighbor_ms[neighbor_count] = candidate.m;
                     neighbor_count += 1u;
                 };
-                if (node<ReSTIR>()->visibility_reuse()) {
-                    auto light_sample = LightSampler::Sample::zero(swl.dimension());
-                    $outline {
-                        light_sample = light_sampler()->sample(
-                            *it, r.u_sel, r.u_light, swl, time);
-                    };
-                    auto occluded = def(true);
-                    $if (light_sample.eval.pdf > 0.f) {
-                        occluded = pipeline().geometry()->intersect_any(light_sample.shadow_ray);
-                    };
-                    $if (occluded) {
-                        r.p_hat = r.w = 0.f;
-                    };
-                }
             });
+            if (node<ReSTIR>()->visibility_reuse()) {
+                auto light_sample = LightSampler::Sample::zero(swl.dimension());
+                $outline {
+                    light_sample = light_sampler()->sample(
+                        *it, r.u_sel, r.u_light, swl, time);
+                };
+                auto occluded = def(true);
+                $if (light_sample.eval.pdf > 0.f) {
+                    occluded = pipeline().geometry()->intersect_any(light_sample.shadow_ray);
+                };
+                $if (occluded) {
+                    r.p_hat = r.w = 0.f;
+                };
+            }
             $for (i, 0u, neighbor_count) {
                 auto neighbor_ray = neighbor_rays[i];
                 auto neighbor_hit = neighbor_hits[i];
