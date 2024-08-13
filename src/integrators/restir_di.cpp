@@ -44,6 +44,8 @@ private:
     bool _temporal_reuse;
     bool _spatial_reuse;
     bool _unbiased;
+    bool _decorrelate;
+    uint _mutation_num;
 public:
     ReSTIR(Scene *scene, const SceneNodeDesc *desc) noexcept
         : ProgressiveIntegrator{scene, desc},
@@ -51,7 +53,9 @@ public:
           _visibility_reuse{desc->property_bool_or_default("visibility_reuse", true)},
           _temporal_reuse{desc->property_bool_or_default("temporal_reuse", true)},
           _spatial_reuse{desc->property_bool_or_default("spatial_reuse", true)},
-          _unbiased{desc->property_bool_or_default("unbiased", false)} {}
+          _unbiased{desc->property_bool_or_default("unbiased", false)},
+          _decorrelate{desc->property_bool_or_default("decorrelate", false)},
+          _mutation_num{desc->property_uint_or_default("mutation_num", 1u)} {}
     [[nodiscard]] luisa::string_view impl_type() const noexcept override { return LUISA_RENDER_PLUGIN_NAME; }
     [[nodiscard]] luisa::unique_ptr<Integrator::Instance> build(
         Pipeline &pipeline, CommandBuffer &cb) const noexcept override;
@@ -60,6 +64,8 @@ public:
     [[nodiscard]] bool temporal_reuse() const noexcept { return _temporal_reuse; }
     [[nodiscard]] bool spatial_reuse() const noexcept { return _spatial_reuse; }
     [[nodiscard]] bool unbiased() const noexcept { return _unbiased; }
+    [[nodiscard]] bool decorrelate() const noexcept { return _decorrelate; }
+    [[nodiscard]] uint mutation_num() const noexcept { return _mutation_num; }
 };
 
 class ReSTIRInstance final : public ProgressiveIntegrator::Instance {
@@ -235,7 +241,7 @@ protected:
         auto temporal_reuse_shader = compile_async<2>(device, [&](UInt frame_index, Float time) noexcept {
             set_block_size(16u, 16u, 1u);
             auto pixel_id = dispatch_id().xy();
-            temporal_reuse(camera, frame_index, pixel_id, time);
+            _temporal_reuse(camera, frame_index, pixel_id, time);
         });
         auto swap_buffer_shader = compile_async<2>(device, [&]() noexcept {
             set_block_size(16u, 16u, 1u);
@@ -243,6 +249,11 @@ protected:
             auto index = pixel_id.x + pixel_id.y * resolution.x;
             auto r = _reservoir_buffer_out->read(index);
             _reservoir_buffer->write(index, r);
+        });
+        auto decorrelate_shader = compile_async<2>(device, [&](UInt frame_index, Float time) noexcept {
+            set_block_size(16u, 16u, 1u);
+            auto pixel_id = dispatch_id().xy();
+            _decorrelate_samples(camera, frame_index, pixel_id, time);
         });
         auto spatial_reuse_shader = compile_async<2>(device, [&](UInt frame_index, UInt pass_index, Float time) noexcept {
             set_block_size(16u, 16u, 1u);
@@ -265,6 +276,7 @@ protected:
         sample_light_shader.get().set_name("sample_light");
         temporal_reuse_shader.get().set_name("temporal_reuse");
         swap_buffer_shader.get().set_name("swap_buffer");
+        decorrelate_shader.get().set_name("decorrelate");
         spatial_reuse_shader.get().set_name("spatial_reuse");
         render_shader.get().set_name("render");
         auto integrator_shader_compilation_time = clock_compile.toc();
@@ -281,13 +293,16 @@ protected:
         for (auto s : shutter_samples) {
             pipeline().update(command_buffer, s.point.time);
             for (auto i = 0u; i < s.spp; i++) {
-                // camera->film()->clear(command_buffer);
+                camera->film()->clear(command_buffer);
                 if (node<ReSTIR>()->presample_lights()) {
                     command_buffer << presample_light_shader.get()(sample_id).dispatch(LightSubsetBuffer::subset_num * LightSubsetBuffer::subset_size);
                 }
                 command_buffer << sample_light_shader.get()(sample_id, s.point.time).dispatch(resolution);
                 if (node<ReSTIR>()->temporal_reuse() && sample_id != 0u) {
                     command_buffer << temporal_reuse_shader.get()(sample_id, s.point.time).dispatch(resolution);
+                    if (node<ReSTIR>()->decorrelate()) {
+                        command_buffer << decorrelate_shader.get()(sample_id, s.point.time).dispatch(resolution);
+                    }
                 }
                 command_buffer << swap_buffer_shader.get()().dispatch(resolution);
                 if (node<ReSTIR>()->spatial_reuse()) {
@@ -404,7 +419,7 @@ protected:
         };
         _reservoir_buffer_out->write(index, r);
     }
-    void temporal_reuse(const Camera::Instance *camera, Expr<uint> frame_index, Expr<uint2> pixel_id, Expr<float> time) const noexcept {
+    void _temporal_reuse(const Camera::Instance *camera, Expr<uint> frame_index, Expr<uint2> pixel_id, Expr<float> time) const noexcept {
         sampler()->start(pixel_id, frame_index);
         auto resolution = camera->film()->node()->resolution();
         auto index = pixel_id.x + pixel_id.y * resolution.x;
@@ -458,6 +473,79 @@ protected:
                 };
             });
             r = r.update(candidate, sampler()->generate_1d());
+            $break;
+        };
+        _reservoir_buffer_out->write(index, r);
+    }
+    void _decorrelate_samples(const Camera::Instance *camera, Expr<uint> frame_index, Expr<uint2> pixel_id, Expr<float> time) const noexcept {
+        sampler()->start(pixel_id, frame_index);
+        auto resolution = camera->film()->node()->resolution();
+        auto index = pixel_id.x + pixel_id.y * resolution.x;
+        auto spectrum = pipeline().spectrum();
+        auto swl = spectrum->sample(spectrum->node()->is_fixed() ? 0.f : sampler()->generate_1d());
+        auto ray = _visibility_buffer->read_ray(index);
+        auto hit = _visibility_buffer->read_hit(index);
+        auto r = _reservoir_buffer_out->read(index);
+        $loop {
+            auto it = pipeline().geometry()->interaction(ray, hit);
+            auto wo = -ray->direction();
+            // miss
+            $if (!it->valid() | !it->shape().has_surface()) {
+                $break;
+            };
+            $if (r.p_hat == 0.f | r.w == 0.f) {
+                $break;
+            };
+            // evaluate material
+            auto surface_tag = it->shape().surface_tag();
+            PolymorphicCall<Surface::Closure> call;
+            pipeline().surfaces().dispatch(surface_tag, [&](auto surface) noexcept {
+                surface->closure(call, *it, swl, wo, 1.f, time);
+            });
+            call.execute([&](auto closure) noexcept {
+                // some preparations
+                if (auto dispersive = closure->is_dispersive()) {
+                    $if (*dispersive) { swl.terminate_secondary(); };
+                }
+                // perform MCMC mutations
+                auto constexpr s1 = 1.f/1024.f, s2 = 1.f/64.f;
+                auto mutate_1d = [&](auto u) noexcept {
+                    auto uu = abs(2.f * u - 1.f);
+                    auto s = s1 * exp(-log(s1 / s2) * uu);
+                    return ite(u < .5f, 1.f, -1.f) * s;
+                };
+                auto mutate_2d = [&](auto u) noexcept {
+                    auto radius = s2 * sqrt(-2.f * log(max(std::numeric_limits<float>::min(), 1.f - u.x)));
+                    auto phi = 2.f * pi * u.y;
+                    return radius * make_float2(cos(phi), sin(phi));
+                };
+                $for(i, 0u, node<ReSTIR>()->mutation_num()) {
+                    auto uu_sel = clamp(r.u_sel + mutate_1d(sampler()->generate_1d()), 0.f, 1.f);
+                    auto uu_light = clamp(r.u_light + mutate_2d(sampler()->generate_2d()), 0.f, 1.f);
+                    auto light_sample = LightSampler::Sample::zero(swl.dimension());
+                    auto occluded = def(false);
+                    $outline {
+                        light_sample = light_sampler()->sample(
+                            *it, uu_sel, uu_light, swl, time);
+                    };
+                    if (node<ReSTIR>()->visibility_reuse()) {
+                        occluded = pipeline().geometry()->intersect_any(light_sample.shadow_ray);
+                    }
+                    $if(light_sample.eval.pdf > 0.f & !occluded) {
+                        auto wi = light_sample.shadow_ray->direction();
+                        auto eval = closure->evaluate(wo, wi);
+                        $if (eval.pdf > 0.f) {
+                            auto Li = eval.f * light_sample.eval.L;
+                            auto p_hat = spectrum->cie_y(swl, Li);
+                            $if(sampler()->generate_1d() < min(1.f, p_hat / r.p_hat)) {
+                                r.u_sel = uu_sel;
+                                r.u_light = uu_light;
+                                r.p_hat = p_hat;
+                            };
+                        };
+                    };
+                };
+            });
             $break;
         };
         _reservoir_buffer_out->write(index, r);
