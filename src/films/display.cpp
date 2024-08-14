@@ -435,6 +435,10 @@ private:
         if (auto current_time = _clock.toc();
             current_time - _last_frame_time >= interval) {
             _last_frame_time = current_time;
+            // press Esc to close window quickly
+            if (ImGui::IsKeyPressed(ImGuiKey::ImGuiKey_Escape)) {
+                _window->set_should_close(true);
+            }
             if (!_rendering_done && _window->should_close()) {
                 command_buffer << synchronize();
                 exit(0);// FIXME: exit gracefully
