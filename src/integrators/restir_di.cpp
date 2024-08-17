@@ -100,7 +100,7 @@ public:
     public:
         static auto constexpr subset_size = 64u;
         static auto constexpr subset_num = 128u;
-        LightSubsetBuffer(const Spectrum::Instance *spectrum) noexcept {
+        explicit LightSubsetBuffer(const Spectrum::Instance *spectrum) noexcept {
             auto &&device = spectrum->pipeline().device();
             _u_sel = device.create_buffer<float>(subset_num * subset_size);
             _u_light = device.create_buffer<float2>(subset_num * subset_size);
