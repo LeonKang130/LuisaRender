@@ -36,7 +36,7 @@ template<uint dim, typename F>
  * Accompanied light sampling technique must be independent of shading points
  * so that light samples can be stored as three float point numbers
 */
-class ReSTIR final : public ProgressiveIntegrator {
+class ReSTIRDirectIllumination final : public ProgressiveIntegrator {
 
 private:
     bool _presample_lights;
@@ -47,7 +47,7 @@ private:
     bool _decorrelate;
     uint _mutation_num;
 public:
-    ReSTIR(Scene *scene, const SceneNodeDesc *desc) noexcept
+    ReSTIRDirectIllumination(Scene *scene, const SceneNodeDesc *desc) noexcept
         : ProgressiveIntegrator{scene, desc},
           _presample_lights{desc->property_bool_or_default("presample_lights", true)},
           _visibility_reuse{desc->property_bool_or_default("visibility_reuse", true)},
@@ -68,7 +68,7 @@ public:
     [[nodiscard]] uint mutation_num() const noexcept { return _mutation_num; }
 };
 
-class ReSTIRInstance final : public ProgressiveIntegrator::Instance {
+class ReSTIRDirectIlluminationInstance final : public ProgressiveIntegrator::Instance {
 
 public:
     using ProgressiveIntegrator::Instance::Instance;
@@ -202,7 +202,7 @@ protected:
 
         auto pixel_count = resolution.x * resolution.y;
         sampler()->reset(command_buffer, resolution, pixel_count, spp);
-        // initialize ReSTIR buffers
+        // initialize ReSTIRDirectIllumination buffers
         if (!_visibility_buffer) {
             _visibility_buffer = luisa::make_unique<VisibilityBuffer>(pipeline().spectrum(), pixel_count);
         }
@@ -258,10 +258,9 @@ protected:
         auto spatial_reuse_shader = compile_async<2>(device, [&](UInt frame_index, UInt pass_index, Float time) noexcept {
             set_block_size(16u, 16u, 1u);
             auto pixel_id = dispatch_id().xy();
-            if(node<ReSTIR>()->unbiased()) {
+            if (node<ReSTIRDirectIllumination>()->unbiased()) {
                 _unbiased_spatial_reuse(camera, frame_index, pass_index, pixel_id, time);
-            }
-            else {
+            } else {
                 _spatial_reuse(camera, frame_index, pass_index, pixel_id, time);
             }
         });
@@ -294,18 +293,18 @@ protected:
             pipeline().update(command_buffer, s.point.time);
             for (auto i = 0u; i < s.spp; i++) {
                 camera->film()->clear(command_buffer);
-                if (node<ReSTIR>()->presample_lights()) {
+                if (node<ReSTIRDirectIllumination>()->presample_lights()) {
                     command_buffer << presample_light_shader.get()(sample_id).dispatch(LightSubsetBuffer::subset_num * LightSubsetBuffer::subset_size);
                 }
                 command_buffer << sample_light_shader.get()(sample_id, s.point.time).dispatch(resolution);
-                if (node<ReSTIR>()->temporal_reuse() && sample_id != 0u) {
+                if (node<ReSTIRDirectIllumination>()->temporal_reuse() && sample_id != 0u) {
                     command_buffer << temporal_reuse_shader.get()(sample_id, s.point.time).dispatch(resolution);
-                    if (node<ReSTIR>()->decorrelate()) {
+                    if (node<ReSTIRDirectIllumination>()->decorrelate()) {
                         command_buffer << decorrelate_shader.get()(sample_id, s.point.time).dispatch(resolution);
                     }
                 }
                 command_buffer << swap_buffer_shader.get()().dispatch(resolution);
-                if (node<ReSTIR>()->spatial_reuse()) {
+                if (node<ReSTIRDirectIllumination>()->spatial_reuse()) {
                     for (auto j = 0u; j < 2u; j++) {
                         command_buffer << spatial_reuse_shader.get()(sample_id, j, s.point.time).dispatch(resolution);
                         command_buffer << swap_buffer_shader.get()().dispatch(resolution);
@@ -331,8 +330,11 @@ protected:
         LUISA_INFO("Rendering finished in {} ms.", render_time);
     }
     void _sample_light(const Camera::Instance *camera, Expr<uint> frame_index, Expr<uint2> pixel_id, Expr<float> time) const noexcept {
-        sampler()->start($block_id.xy(), frame_index);
-        auto u_subset = sampler()->generate_1d();
+        auto u_subset = def(0.f);
+        if (node<ReSTIRDirectIllumination>()->presample_lights()) {
+            sampler()->start($block_id.xy(), frame_index);
+            u_subset = sampler()->generate_1d();
+        }
         sampler()->start(pixel_id, frame_index);
         auto resolution = camera->film()->node()->resolution();
         auto index = pixel_id.x + pixel_id.y * resolution.x;
@@ -367,12 +369,11 @@ protected:
                 $for (x, 0u, 32u) {
                     auto u_sel = def(0.f);
                     auto u_light = def(make_float2(0.f));
-                    if (node<ReSTIR>()->presample_lights()) {
+                    if (node<ReSTIRDirectIllumination>()->presample_lights()) {
                         auto [uu_sel, uu_light] = _light_subset_buffer->sample(u_subset, sampler()->generate_1d());
                         u_sel = uu_sel;
                         u_light = uu_light;
-                    }
-                    else {
+                    } else {
                         u_sel = sampler()->generate_1d();
                         u_light = sampler()->generate_2d();
                     }
@@ -400,7 +401,7 @@ protected:
                 };
             });
             // visibility test
-            if (node<ReSTIR>()->visibility_reuse()) {
+            if (node<ReSTIRDirectIllumination>()->visibility_reuse()) {
                 auto light_sample = LightSampler::Sample::zero(swl.dimension());
                 auto occluded = def(true);
                 $outline {
@@ -508,7 +509,7 @@ protected:
                     $if (*dispersive) { swl.terminate_secondary(); };
                 }
                 // perform MCMC mutations
-                auto constexpr s1 = 1.f/1024.f, s2 = 1.f/64.f;
+                auto constexpr s1 = 1.f / 1024.f, s2 = 1.f / 64.f;
                 auto mutate_1d = [&](auto u) noexcept {
                     auto uu = abs(2.f * u - 1.f);
                     auto s = s1 * exp(-log(s1 / s2) * uu);
@@ -519,7 +520,7 @@ protected:
                     auto phi = 2.f * pi * u.y;
                     return radius * make_float2(cos(phi), sin(phi));
                 };
-                $for(i, 0u, node<ReSTIR>()->mutation_num()) {
+                $for (i, 0u, node<ReSTIRDirectIllumination>()->mutation_num()) {
                     auto uu_sel = clamp(r.u_sel + mutate_1d(sampler()->generate_1d()), 0.f, 1.f);
                     auto uu_light = clamp(r.u_light + mutate_2d(sampler()->generate_2d()), 0.f, 1.f);
                     auto light_sample = LightSampler::Sample::zero(swl.dimension());
@@ -528,16 +529,16 @@ protected:
                         light_sample = light_sampler()->sample(
                             *it, uu_sel, uu_light, swl, time);
                     };
-                    if (node<ReSTIR>()->visibility_reuse()) {
+                    if (node<ReSTIRDirectIllumination>()->visibility_reuse()) {
                         occluded = pipeline().geometry()->intersect_any(light_sample.shadow_ray);
                     }
-                    $if(light_sample.eval.pdf > 0.f & !occluded) {
+                    $if (light_sample.eval.pdf > 0.f & !occluded) {
                         auto wi = light_sample.shadow_ray->direction();
                         auto eval = closure->evaluate(wo, wi);
                         $if (eval.pdf > 0.f) {
                             auto Li = eval.f * light_sample.eval.L;
                             auto p_hat = spectrum->cie_y(swl, Li);
-                            $if(sampler()->generate_1d() < min(1.f, p_hat / r.p_hat)) {
+                            $if (sampler()->generate_1d() < min(1.f, p_hat / r.p_hat)) {
                                 r.u_sel = uu_sel;
                                 r.u_light = uu_light;
                                 r.p_hat = p_hat;
@@ -695,7 +696,7 @@ protected:
                     neighbor_count += 1u;
                 };
             });
-            if (node<ReSTIR>()->visibility_reuse()) {
+            if (node<ReSTIRDirectIllumination>()->visibility_reuse()) {
                 auto light_sample = LightSampler::Sample::zero(swl.dimension());
                 $outline {
                     light_sample = light_sampler()->sample(
@@ -731,7 +732,7 @@ protected:
                     };
                     $if (light_sample.eval.pdf > 0.f) {
                         auto occluded = def(false);
-                        if (node<ReSTIR>()->visibility_reuse()) {
+                        if (node<ReSTIRDirectIllumination>()->visibility_reuse()) {
                             occluded = pipeline().geometry()->intersect_any(light_sample.shadow_ray);
                         }
                         $if (!occluded) {
@@ -819,7 +820,7 @@ protected:
                         Li += eval.f * light_sample.eval.L * r.w / r.p_hat;
                     };
                 };
-                if (node<ReSTIR>()->visibility_reuse()) {
+                if (node<ReSTIRDirectIllumination>()->visibility_reuse()) {
                     _reservoir_buffer_out->write(index, r);
                 }
             });
@@ -832,11 +833,11 @@ protected:
     }
 };
 
-luisa::unique_ptr<Integrator::Instance> ReSTIR::build(
+luisa::unique_ptr<Integrator::Instance> ReSTIRDirectIllumination::build(
     Pipeline &pipeline, CommandBuffer &cb) const noexcept {
-    return luisa::make_unique<ReSTIRInstance>(pipeline, cb, this);
+    return luisa::make_unique<ReSTIRDirectIlluminationInstance>(pipeline, cb, this);
 }
 
 }// namespace luisa::render
 
-LUISA_RENDER_MAKE_SCENE_NODE_PLUGIN(luisa::render::ReSTIR)
+LUISA_RENDER_MAKE_SCENE_NODE_PLUGIN(luisa::render::ReSTIRDirectIllumination)
