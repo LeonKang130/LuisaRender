@@ -95,24 +95,20 @@ public:
 
     class LightSubsetBuffer {
     private:
-        Buffer<float> _u_sel;
-        Buffer<float2> _u_light;
+        Buffer<float3> _u_sample;
     public:
         static auto constexpr subset_size = 64u;
         static auto constexpr subset_num = 128u;
         explicit LightSubsetBuffer(const Spectrum::Instance *spectrum) noexcept {
             auto &&device = spectrum->pipeline().device();
-            _u_sel = device.create_buffer<float>(subset_num * subset_size);
-            _u_light = device.create_buffer<float2>(subset_num * subset_size);
+            _u_sample = device.create_buffer<float3>(subset_num * subset_size);
         }
         void write(Expr<uint> index, Expr<float> u_sel, Expr<float2> u_light) const noexcept {
-            _u_sel->write(index, u_sel);
-            _u_light->write(index, u_light);
+            _u_sample->write(index, make_float3(u_sel, u_light));
         }
         [[nodiscard]] auto read(Expr<uint> index) const noexcept {
-            auto u_sel = _u_sel->read(index);
-            auto u_light = _u_light->read(index);
-            return std::make_pair(u_sel, u_light);
+            auto u_sample = _u_sample->read(index);
+            return std::make_pair(u_sample.x, u_sample.yz());
         }
         [[nodiscard]] auto sample(Expr<float> u1, Expr<float> u2) const noexcept {
             auto subset_index = clamp(u1 * static_cast<float>(subset_num), 0.f, subset_num - 1.f).cast<uint>();
@@ -124,61 +120,56 @@ public:
     class ReservoirBuffer {
     public:
         struct Reservoir {
-            Float u_sel;
-            Float2 u_light;
+            Float3 u_sample;
             Float m;
             Float p_hat;
             Float w;
-            [[nodiscard]] static auto zero() noexcept { return Reservoir{0.f, make_float2(0.f), 0.f, 0.f, 0.f}; }
+            UInt age; // samples older than 15 (255 in RTX DI) frames are discarded
+            [[nodiscard]] static auto zero() noexcept { return Reservoir{make_float3(0.f), 0.f, 0.f, 0.f, 0u}; }
             [[nodiscard]] auto update(Reservoir const &r, Expr<float> u) const noexcept {
-                auto rr = Reservoir::zero();
-                rr.m = r.m + m;
+                auto rr = r;
                 auto w1 = r.w * r.m, w2 = w * m;
                 auto w_sum = w1 + w2;
-                $if (u * w_sum < w1) {
-                    rr.u_sel = r.u_sel;
-                    rr.u_light = r.u_light;
-                    rr.p_hat = r.p_hat;
-                }
-                $else {
-                    rr.u_sel = u_sel;
-                    rr.u_light = u_light;
+                $if (u * w_sum > w1) {
+                    rr.u_sample = u_sample;
                     rr.p_hat = p_hat;
+                    rr.age = age;
                 };
+                rr.m = r.m + m;
                 rr.w = ite(rr.m > 0.f, w_sum / rr.m, 0.f);
                 return rr;
             }
         };
     private:
-        Buffer<float> _u_sel;
-        Buffer<float2> _u_light;
+        Buffer<float3> _u_sample;
         Buffer<float> _m;
         Buffer<float> _p_hat;
         Buffer<float> _w;
+        Buffer<uint> _age;
     public:
         ReservoirBuffer(const Spectrum::Instance *spectrum, size_t size) noexcept {
             auto &&device = spectrum->pipeline().device();
-            _u_sel = device.create_buffer<float>(size);
-            _u_light = device.create_buffer<float2>(size);
+            _u_sample = device.create_buffer<float3>(size);
             _m = device.create_buffer<float>(size);
             _p_hat = device.create_buffer<float>(size);
             _w = device.create_buffer<float>(size);
+            _age = device.create_buffer<uint>(size);
         }
         [[nodiscard]] auto read(Expr<uint> index) const noexcept {
             auto r = Reservoir::zero();
-            r.u_sel = _u_sel->read(index);
-            r.u_light = _u_light->read(index);
+            r.u_sample = _u_sample->read(index);
             r.m = _m->read(index);
             r.p_hat = _p_hat->read(index);
             r.w = _w->read(index);
+            r.age = _age->read(index);
             return r;
         }
         void write(Expr<uint> index, Reservoir const &r) const noexcept {
-            _u_sel->write(index, r.u_sel);
-            _u_light->write(index, r.u_light);
+            _u_sample->write(index, r.u_sample);
             _m->write(index, r.m);
             _p_hat->write(index, r.p_hat);
             _w->write(index, r.w);
+            _age->write(index, r.age);
         }
     };
 
@@ -292,7 +283,7 @@ protected:
         for (auto s : shutter_samples) {
             pipeline().update(command_buffer, s.point.time);
             for (auto i = 0u; i < s.spp; i++) {
-                camera->film()->clear(command_buffer);
+                // camera->film()->clear(command_buffer);
                 if (node<ReSTIRDirectIllumination>()->presample_lights()) {
                     command_buffer << presample_light_shader.get()(sample_id).dispatch(LightSubsetBuffer::subset_num * LightSubsetBuffer::subset_size);
                 }
@@ -384,8 +375,7 @@ protected:
                     };
                     // direct lighting
                     auto candidate = ReservoirBuffer::Reservoir::zero();
-                    candidate.u_sel = u_sel;
-                    candidate.u_light = u_light;
+                    candidate.u_sample = make_float3(u_sel, u_light);
                     candidate.m = 1.f;
                     $if (light_sample.eval.pdf > 0.0f) {
                         auto wi = light_sample.shadow_ray->direction();
@@ -406,7 +396,7 @@ protected:
                 auto occluded = def(true);
                 $outline {
                     light_sample = light_sampler()->sample(
-                        *it, r.u_sel, r.u_light, swl, time);
+                        *it, r.u_sample.x, r.u_sample.yz(), swl, time);
                 };
                 $if (light_sample.eval.pdf > 0.f &
                      light_sample.eval.L.any([](auto x) { return x > 0.f; })) {
@@ -433,6 +423,9 @@ protected:
         auto m_capped = min(candidate.m, 20.f * r.m);
         candidate.m = m_capped;
         $loop {
+            $if(candidate.age > 15u) {
+                $break;
+            };
             auto it = pipeline().geometry()->interaction(ray, hit);
             auto wo = -ray->direction();
             // miss
@@ -442,7 +435,7 @@ protected:
             auto light_sample = LightSampler::Sample::zero(swl.dimension());
             $outline {
                 light_sample = light_sampler()->sample(
-                    *it, candidate.u_sel, candidate.u_light, swl, time);
+                    *it, candidate.u_sample.x, candidate.u_sample.yz(), swl, time);
             };
             // evaluate material
             auto surface_tag = it->shape().surface_tag();
@@ -476,6 +469,7 @@ protected:
             r = r.update(candidate, sampler()->generate_1d());
             $break;
         };
+        r.age += 1u;
         _reservoir_buffer_out->write(index, r);
     }
     void _decorrelate_samples(const Camera::Instance *camera, Expr<uint> frame_index, Expr<uint2> pixel_id, Expr<float> time) const noexcept {
@@ -521,8 +515,8 @@ protected:
                     return radius * make_float2(cos(phi), sin(phi));
                 };
                 $for (i, 0u, node<ReSTIRDirectIllumination>()->mutation_num()) {
-                    auto uu_sel = clamp(r.u_sel + mutate_1d(sampler()->generate_1d()), 0.f, 1.f);
-                    auto uu_light = clamp(r.u_light + mutate_2d(sampler()->generate_2d()), 0.f, 1.f);
+                    auto uu_sel = clamp(r.u_sample.x + mutate_1d(sampler()->generate_1d()), 0.f, 1.f);
+                    auto uu_light = clamp(r.u_sample.yz() + mutate_2d(sampler()->generate_2d()), 0.f, 1.f);
                     auto light_sample = LightSampler::Sample::zero(swl.dimension());
                     auto occluded = def(false);
                     $outline {
@@ -539,8 +533,7 @@ protected:
                             auto Li = eval.f * light_sample.eval.L;
                             auto p_hat = spectrum->cie_y(swl, Li);
                             $if (sampler()->generate_1d() < min(1.f, p_hat / r.p_hat)) {
-                                r.u_sel = uu_sel;
-                                r.u_light = uu_light;
+                                r.u_sample = make_float3(uu_sel, uu_light);
                                 r.p_hat = p_hat;
                             };
                         };
@@ -596,7 +589,7 @@ protected:
                     auto candidate = _reservoir_buffer->read(neighbor_pixel_id.x + neighbor_pixel_id.y * resolution.x);
                     $outline {
                         light_sample = light_sampler()->sample(
-                            *it, candidate.u_sel, candidate.u_light, swl, time);
+                            *it, candidate.u_sample.x, candidate.u_sample.yz(), swl, time);
                     };
                     $if (light_sample.eval.pdf > 0.f & candidate.p_hat > 0.f) {
                         auto wi = light_sample.shadow_ray->direction();
@@ -671,7 +664,7 @@ protected:
                     auto candidate = _reservoir_buffer->read(neighbor_pixel_id.x + neighbor_pixel_id.y * resolution.x);
                     $outline {
                         light_sample = light_sampler()->sample(
-                            *it, candidate.u_sel, candidate.u_light, swl, time);
+                            *it, candidate.u_sample.x, candidate.u_sample.yz(), swl, time);
                     };
                     $if (light_sample.eval.pdf > 0.f & candidate.p_hat > 0.f) {
                         auto wi = light_sample.shadow_ray->direction();
@@ -700,7 +693,7 @@ protected:
                 auto light_sample = LightSampler::Sample::zero(swl.dimension());
                 $outline {
                     light_sample = light_sampler()->sample(
-                        *it, r.u_sel, r.u_light, swl, time);
+                        *it, r.u_sample.x, r.u_sample.yz(), swl, time);
                 };
                 auto occluded = def(true);
                 $if (light_sample.eval.pdf > 0.f) {
@@ -728,7 +721,7 @@ protected:
                     auto light_sample = LightSampler::Sample::zero(swl.dimension());
                     $outline {
                         light_sample = light_sampler()->sample(
-                            *neighbor_it, r.u_sel, r.u_light, swl, time);
+                            *neighbor_it, r.u_sample.x, r.u_sample.yz(), swl, time);
                     };
                     $if (light_sample.eval.pdf > 0.f) {
                         auto occluded = def(false);
@@ -788,7 +781,7 @@ protected:
             auto light_sample = LightSampler::Sample::zero(swl.dimension());
             $outline {
                 light_sample = light_sampler()->sample(
-                    *it, r.u_sel, r.u_light, swl, time);
+                    *it, r.u_sample.x, r.u_sample.yz(), swl, time);
             };
             // trace shadow ray
             $if (light_sample.eval.pdf > 0.f &
